@@ -15,7 +15,7 @@ import socket
 import json
 
 # === НАСТРОЙКИ ===
-BOT_TOKEN = '8124340268:AAGgA3BOlHHVecnM7vDw66Hx_XvGj_N6Jtc'  # ← Замените
+BOT_TOKEN = 'xxx'  # ← Замените
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
