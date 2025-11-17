@@ -7,12 +7,12 @@ import atexit
 import time
 
 # === НАСТРОЙКИ ===
-BOT_TOKEN = 'xxx'  # ← Замените
+BOT_TOKEN = 'xxx'  # ← Замените на свой
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
-active_users = set()
-remind_skipped = {}
+active_users = set()          # Активные пользователи (в памяти)
+remind_skipped = {}           # Кто отложил напоминание
 
 # === КОНФИГУРАЦИЯ РЕСУРСОВ ===
 RESOURCES = {
@@ -33,6 +33,8 @@ def get_db():
 def init_db():
     conn = get_db()
     cursor = conn.cursor()
+
+    # Таблицы для ресурсов
     for config in RESOURCES.values():
         table = config["table"]
         cursor.execute(f'''
@@ -42,11 +44,34 @@ def init_db():
                 date TEXT NOT NULL
             )
         ''')
+
+    # Таблица пользователей
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            active BOOLEAN DEFAULT 1,
+            remind_skipped BOOLEAN DEFAULT 0
+        )
+    ''')
+
     conn.commit()
     conn.close()
     print("✅ База данных инициализирована.")
 
+# === ЗАГРУЗКА ПОЛЬЗОВАТЕЛЕЙ ИЗ БД ===
+def load_active_users():
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, remind_skipped FROM users WHERE active = 1")
+    rows = cursor.fetchall()
+    for user_id, skipped in rows:
+        active_users.add(user_id)
+        remind_skipped[user_id] = bool(skipped)
+    conn.close()
+    print(f"📥 Загружено {len(active_users)} активных пользователей.")
+
 init_db()
+load_active_users()
 
 # === ОТПРАВКА МЕНЮ ===
 def send_menu(user_id):
@@ -55,20 +80,34 @@ def send_menu(user_id):
     btn2 = telebot.types.KeyboardButton("💧 Вода")
     btn3 = telebot.types.KeyboardButton("🔥 Газ")
     btn4 = telebot.types.KeyboardButton("📆 Статистика")
-
     keyboard.row(btn1, btn2, btn3)
     keyboard.row(btn4)
-
-    bot.send_message(user_id, "Выберите действие:", reply_markup=keyboard)
+    try:
+        bot.send_message(user_id, "Выберите действие:", reply_markup=keyboard)
+    except:
+        pass
 
 # === ОБРАБОТКА /start ===
 @bot.message_handler(commands=['start'])
 def start_message(message):
     user_id = message.from_user.id
+
+    # Сохраняем/активируем пользователя в БД
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        'INSERT OR REPLACE INTO users (user_id, active, remind_skipped) VALUES (?, 1, COALESCE((SELECT remind_skipped FROM users WHERE user_id = ?), 0))',
+        (user_id, user_id)
+    )
+    conn.commit()
+    conn.close()
+
+    # Обновляем память
     if user_id not in active_users:
         active_users.add(user_id)
         remind_skipped[user_id] = False
         print(f"✅ Пользователь добавлен: {user_id}")
+
     send_menu(user_id)
 
 # === ПРОВЕРКА: ВВЕДЕНЫ ЛИ ДАННЫЕ ЗА МЕСЯЦ ===
@@ -121,7 +160,6 @@ def save_meter_reading(message, table):
 @bot.message_handler(func=lambda message: message.text == "📆 Статистика")
 def monthly_stats(message):
     user_id = message.from_user.id
-
     conn = get_db()
     cursor = conn.cursor()
 
@@ -146,14 +184,11 @@ def monthly_stats(message):
             continue
 
         data.sort(key=lambda x: x[0])
-        lines = []
-        lines.append(f"📋 {display_name}\n")
-        lines.append("```\n")
+        lines = [f"📋 {display_name}\n", "```\n"]
         lines.append(f"{'Дата':<12} {'Показания':<10} {'Объем':<8} {'Средн.':<8} {'Ед.':<5}\n")
         lines.append("-" * 50 + "\n")
 
-        consumptions = []  # Только числовые объёмы
-
+        consumptions = []
         for i, (date_str, meter_val) in enumerate(data):
             reading = int(round(meter_val))
             if i == 0:
@@ -167,21 +202,15 @@ def monthly_stats(message):
                 avg = int(round(sum(consumptions) / len(consumptions)))
                 avg_str = str(avg)
 
-            line = (
-                f"{date_str:<12} "
-                f"{reading:<10} "
-                f"{str(consumption):<8} "
-                f"{avg_str:<8} "
-                f"{unit:<5}"
-            )
+            line = f"{date_str:<12} {reading:<10} {str(consumption):<8} {avg_str:<8} {unit:<5}"
             lines.append(line + "\n")
 
         lines.append("```\n")
         full_text = "".join(lines)
         try:
             bot.send_message(user_id, full_text, parse_mode="MarkdownV2")
-        except Exception:
-            bot.send_message(user_id, full_text.replace('\\', ''))
+        except Exception as e:
+            bot.send_message(user_id, full_text.replace('\\', '') + f"\n\n(Ошибка форматирования: {str(e)})")
 
     conn.close()
     send_menu(message)
@@ -193,20 +222,43 @@ scheduler.start()
 def send_monthly_reminder():
     if has_user_entered_current_month_data():
         return
+
     for user_id in list(active_users):
         if remind_skipped.get(user_id, False):
             continue
+
         try:
             keyboard = telebot.types.InlineKeyboardMarkup()
             btn_t = telebot.types.InlineKeyboardButton("⏰ Напомнить завтра", callback_data="remind_tomorrow")
             btn_d = telebot.types.InlineKeyboardButton("✅ Уже ввёл", callback_data="remind_done")
             keyboard.add(btn_t, btn_d)
+
             bot.send_message(user_id, "📢 Пора ввести показания!", reply_markup=keyboard)
-        except Exception as e:
-            print(f"❌ Ошибка отправки {user_id}: {e}")
-            if "blocked" in str(e).lower():
+
+        except telebot.apihelper.ApiTelegramException as e:
+            description = e.description.lower()
+            if e.error_code == 403 or "blocked" in description:
+                print(f"🚫 Пользователь {user_id} заблокировал бота. Деактивируем.")
                 active_users.discard(user_id)
                 remind_skipped.pop(user_id, None)
+                conn = get_db()
+                cursor = conn.cursor()
+                cursor.execute("UPDATE users SET active = 0 WHERE user_id = ?", (user_id,))
+                conn.commit()
+                conn.close()
+            elif e.error_code == 400 and "chat not found" in description:
+                print(f"⚠️ Чат не найден (400) для {user_id}. Удаляем.")
+                active_users.discard(user_id)
+                remind_skipped.pop(user_id, None)
+                conn = get_db()
+                cursor = conn.cursor()
+                cursor.execute("UPDATE users SET active = 0 WHERE user_id = ?", (user_id,))
+                conn.commit()
+                conn.close()
+            else:
+                print(f"❌ Ошибка при отправке {user_id}: {e}")
+        except Exception as e:
+            print(f"❌ Неизвестная ошибка: {e}")
 
 @bot.callback_query_handler(func=lambda call: call.data == "remind_tomorrow")
 def remind_tomorrow(call):
@@ -221,12 +273,14 @@ def remind_tomorrow(call):
     )
 
 def send_remind_message_to_user(user_id):
-    if user_id not in active_users or has_user_entered_current_month_data() or remind_skipped.get(user_id, False):
+    if (user_id not in active_users or
+        has_user_entered_current_month_data() or
+        remind_skipped.get(user_id, False)):
         return
     try:
         bot.send_message(user_id, "📢 Напоминание: пора ввести показания!")
     except Exception as e:
-        print(f"❌ Ошибка: {e}")
+        print(f"❌ Ошибка при напоминании: {e}")
 
 @bot.callback_query_handler(func=lambda call: call.data == "remind_done")
 def remind_done(call):
@@ -234,9 +288,16 @@ def remind_done(call):
     remind_skipped[user_id] = True
     bot.answer_callback_query(call.id, "Спасибо!")
     bot.edit_message_text("✅ Отлично! До следующего месяца.", call.message.chat.id, call.message.message_id)
+    # Обновим в БД
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET remind_skipped = 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
 
 # === ЗАПУСК ===
 if __name__ == '__main__':
+    # Ежемесячное напоминание: 1-го числа в 9:00
     scheduler.add_job(send_monthly_reminder, 'cron', day=1, hour=9, minute=0, timezone=timezone('Europe/Moscow'))
     print("✅ Бот запущен. Готов к работе.")
 
