@@ -124,7 +124,7 @@ def send_menu(user_id):
     btn4 = telebot.types.KeyboardButton("📆 Статистика")
     keyboard.row(btn1, btn2, btn3)
     keyboard.row(btn4)
-    safe_send(user_id, "Выберите действие:", reply_markup=keyboard)
+    safe_send(user_id, "Выберите действие через меню:", reply_markup=keyboard)
 
 # === /start ===
 @bot.message_handler(commands=['start'])
@@ -366,6 +366,39 @@ def remind_done(call):
     cursor.execute("UPDATE users SET remind_skipped = 1 WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
+
+# === ЭХО-ОБРАБОТЧИК: НЕИЗВЕСТНЫЕ СООБЩЕНИЯ ===
+@bot.message_handler(func=lambda message: True)
+def echo_handler(message):
+    user_id = message.from_user.id
+
+    # Проверим: не ожидает ли бот ввод показаний?
+    # Если ожидает — не вмешиваемся (обработает save_meter_reading)
+    # Здесь мы просто пропускаем, если бот уже в режиме ввода
+    # (реализация отслеживания состояний — в будущем можно улучшить через FSM)
+    
+    # Пока просто исключим команды и пункты меню
+    text = message.text.strip()
+    known_inputs = {
+        "⚡ Электричество",
+        "💧 Вода",
+        "🔥 Газ",
+        "📆 Статистика"
+    }
+    commands = {'/start', '/help', '/cancel'}
+
+    if text in known_inputs or text in commands:
+        return  # Уже обработано другими хэндлерами
+
+    # Экранируем текст для MarkdownV2
+    user_text = message.text
+    response = (
+        f"Вы написали: *{escape_markdown_v2(user_text)}*\n\n"
+        f"Пожалуйста, выберите действие через меню ⬇️"
+    )
+    safe_send(user_id, response, parse_mode="MarkdownV2")
+    send_menu(user_id)
+
 
 # === ЗАПУСК ===
 if __name__ == '__main__':
