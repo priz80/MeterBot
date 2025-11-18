@@ -138,7 +138,7 @@ def send_menu(user_id):
     btn1 = telebot.types.KeyboardButton("⚡ Электричество")
     btn2 = telebot.types.KeyboardButton("💧 Вода")
     btn3 = telebot.types.KeyboardButton("🔥 Газ")
-    btn4 = telebot.types.KeyboardButton("📆 Статистика")
+    btn4 = telebot.types.KeyboardButton("📆 История")
     keyboard.row(btn1, btn2, btn3)
     keyboard.row(btn4)
     safe_send(user_id, "Выберите действие через меню:", reply_markup=keyboard)
@@ -411,7 +411,7 @@ def save_meter_reading(message, table):
     send_menu(user_id)
 
 # === СТАТИСТИКА ===
-@bot.message_handler(func=lambda message: message.text == "📆 Статистика")
+@bot.message_handler(func=lambda message: message.text == "📆 История")
 def monthly_stats(message):
     user_id = message.from_user.id
     if user_id not in active_users:
