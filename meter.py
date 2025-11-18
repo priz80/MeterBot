@@ -44,17 +44,10 @@ ALLOWED_TABLES = {v["table"] for v in RESOURCES.values()}
 
 # === СИНОНИМЫ РЕСУРСОВ ===
 RESOURCE_ALIASES = {
-    # Электричество
-    'электричество': 'electricity',
-    'electricity': 'electricity',
-    'электро': 'electricity',
-    'свет': 'electricity',
-    # Вода
-    'вода': 'water',
-    'water': 'water',
-    # Газ
-    'газ': 'gas',
-    'gas': 'gas'
+    'электричество': 'electricity', 'electricity': 'electricity',
+    'электро': 'electricity', 'свет': 'electricity',
+    'вода': 'water', 'water': 'water',
+    'газ': 'gas', 'gas': 'gas'
 }
 
 # === РАБОТА С БАЗОЙ ===
@@ -111,12 +104,12 @@ def _deactivate_user(user_id):
     conn.close()
     logging.info("User %s deactivated.", user_id)
 
-# === ОТПРАВКА СООБЩЕНИЙ С ЭКРАНИРОВАНИЕМ ===
+# === ОТПРАВКА СООБЩЕНИЙ С ЭКРАНИРОВАНИЕМ И ВОЗВРАТОМ ===
 def safe_send(user_id, text, parse_mode="MarkdownV2", reply_markup=None):
     if parse_mode == "MarkdownV2":
         text = escape_markdown_v2(text)
     try:
-        bot.send_message(user_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return bot.send_message(user_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
     except telebot.apihelper.ApiTelegramException as e:
         if e.error_code == 400 and "chat not found" in e.description.lower():
             logging.warning("Chat not found (400) for user %s.", user_id)
@@ -128,6 +121,7 @@ def safe_send(user_id, text, parse_mode="MarkdownV2", reply_markup=None):
             logging.error("Telegram API error for user %s: %s", user_id, e)
     except Exception as e:
         logging.error("Failed to send message to %s: %s", user_id, e)
+    return None  # Важно: возвращаем None при ошибке
 
 # === ОТПРАВКА МЕНЮ ===
 def send_menu(user_id):
@@ -167,11 +161,12 @@ def help_message(message):
         "• ⚡ Электричество\n"
         "• 💧 Вода\n"
         "• 🔥 Газ\n\n"
-        "Каждый месяц 1-го числа вам придёт напоминание.\n\n"
+        "Каждый месяц 10-го числа вам придёт напоминание.\n\n"
         "Команды:\n"
         "• /start — главное меню\n"
         "• /help — эта справка\n"
-        "• /delete — удалить запись\n"
+        "• /del — удалить запись\n"
+        "• /undo — отменить удаление\n"
         "• /cancel — отмена и возврат в меню"
     )
     safe_send(message.from_user.id, text, parse_mode="MarkdownV2")
@@ -180,8 +175,8 @@ def help_message(message):
 def cancel(message):
     send_menu(message.from_user.id)
 
-# === /delete — УДАЛЕНИЕ ЗАПИСИ С ПОДТВЕРЖДЕНИЕМ ===
-@bot.message_handler(commands=['delete'])
+# === /del — УДАЛЕНИЕ ЗАПИСИ С КНОПКАМИ ===
+@bot.message_handler(commands=['del'])
 def delete_entry(message):
     user_id = message.from_user.id
     text = message.text.strip()
@@ -191,9 +186,9 @@ def delete_entry(message):
         help_text = (
             "❌ Неверный формат команды.\n\n"
             "Используйте:\n"
-            "`/delete ДД.ММ.ГГГГ ресурс`\n\n"
+            "`/del ДД.ММ.ГГГГ ресурс`\n\n"
             "Пример:\n"
-            "`/delete 25.11.2025 электричество`\n\n"
+            "`/del 25.11.2025 электричество`\n\n"
             "Доступные ресурсы:\n"
             "• `электричество` (или `электро`, `свет`)\n"
             "• `вода`\n"
@@ -206,7 +201,7 @@ def delete_entry(message):
     resource_input = resource_input.lower()
 
     if resource_input not in RESOURCE_ALIASES:
-        safe_send(user_id, "❌ Неизвестный ресурс. Введите `/delete` для подсказки.", parse_mode="MarkdownV2")
+        safe_send(user_id, "❌ Неизвестный ресурс. Введите `/del` для подсказки.", parse_mode="MarkdownV2")
         return
 
     table = RESOURCE_ALIASES[resource_input]
@@ -225,29 +220,32 @@ def delete_entry(message):
     cursor = conn.cursor()
     cursor.execute(f"SELECT meter FROM {table} WHERE date = ?", (date_db,))
     row = cursor.fetchone()
+    conn.close()
 
     if not row:
         safe_send(user_id, f"❌ Запись за {date_str} в разделе *{display_name}* не найдена.", parse_mode="MarkdownV2")
-        conn.close()
         return
 
     meter_value = row[0]
-    conn.close()
+    question = f"Вы точно хотите удалить запись?\nДата: {date_str}, {display_name}: {int(round(meter_value))}?"
 
-    # Сохраняем в контекст для /undo
-    message_to_edit = safe_send(user_id, f"Вы точно хотите удалить запись?\nДата: {date_str}, {display_name}: {int(round(meter_value))}?", parse_mode="MarkdownV2")
+    sent = safe_send(user_id, question, parse_mode="MarkdownV2")
+    if not sent:
+        logging.error("Не удалось отправить сообщение подтверждения.")
+        return
 
-    # Инлайн-кнопки подтверждения
     keyboard = telebot.types.InlineKeyboardMarkup()
     btn_yes = telebot.types.InlineKeyboardButton("✅ Да", callback_data=f"confirm_delete:{table}:{date_db}:{meter_value}")
     btn_no = telebot.types.InlineKeyboardButton("❌ Нет", callback_data="cancel_delete")
     keyboard.add(btn_yes, btn_no)
-    try:
-        bot.edit_message_reply_markup(user_id, message_to_edit.message_id, reply_markup=keyboard)
-    except:
-        pass  # Если не получится — не критично
 
-# === КОЛБЭКИ ДЛЯ УДАЛЕНИЯ ===
+    try:
+        bot.edit_message_reply_markup(chat_id=sent.chat.id, message_id=sent.message_id, reply_markup=keyboard)
+    except Exception as e:
+        logging.error("Не удалось добавить кнопки: %s", e)
+        safe_send(user_id, "⚠️ Не удалось добавить кнопки. Попробуйте снова.")
+
+# === КОЛБЭКИ УДАЛЕНИЯ ===
 @bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_delete:"))
 def confirm_delete(call):
     user_id = call.from_user.id
@@ -261,14 +259,12 @@ def confirm_delete(call):
         cursor = conn.cursor()
         cursor.execute(f"DELETE FROM {table} WHERE date = ? AND meter = ?", (date_db, meter_value))
         if cursor.rowcount > 0:
-            # Сохраняем для /undo
             last_deleted[user_id] = (table, date_db, meter_value, datetime.now(timezone('Europe/Moscow')))
             conn.commit()
             safe_send(user_id, f"✅ Запись удалена:\n*{display_name}*, дата: {date_str}, показания: {int(round(meter_value))}", parse_mode="MarkdownV2")
         else:
             safe_send(user_id, "❌ Запись не найдена — возможно, уже удалена.")
         conn.close()
-        send_menu(user_id)
     except Exception as e:
         logging.error("Delete error: %s", e)
         safe_send(user_id, "❌ Ошибка при удалении.")
@@ -277,11 +273,15 @@ def confirm_delete(call):
             bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
         except:
             pass
+    send_menu(user_id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "cancel_delete")
 def cancel_delete(call):
     user_id = call.from_user.id
-    bot.edit_message_text("❌ Удаление отменено.", call.message.chat.id, call.message.message_id)
+    try:
+        bot.edit_message_text("❌ Удаление отменено.", call.message.chat.id, call.message.message_id)
+    except Exception as e:
+        logging.error("Ошибка при редактировании: %s", e)
     send_menu(user_id)
 
 # === /undo — ОТМЕНА УДАЛЕНИЯ ===
@@ -465,7 +465,7 @@ def echo_handler(message):
         "🔥 Газ",
         "📆 Статистика"
     }
-    commands = {'/start', '/help', '/cancel', '/delete', '/undo'}
+    commands = {'/start', '/help', '/cancel', '/del', '/undo'}
 
     if text in known_inputs or text in commands:
         return
@@ -537,7 +537,7 @@ def remind_done(call):
 
 # === ЗАПУСК ===
 if __name__ == '__main__':
-    scheduler.add_job(send_monthly_reminder, 'cron', day=1, hour=9, minute=0, timezone=timezone('Europe/Moscow'))
+    scheduler.add_job(send_monthly_reminder, 'cron', day=10, hour=9, minute=0, timezone=timezone('Europe/Moscow'))
     logging.info("Bot started. Awaiting messages.")
     atexit.register(lambda: scheduler.shutdown())
     while True:
