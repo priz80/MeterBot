@@ -6,15 +6,14 @@ from pytz import timezone
 import atexit
 import time
 import logging
-import re  # Для экранирования MarkdownV2
+import re
 
 # === ФУНКЦИЯ ЭКРАНИРОВАНИЯ ДЛЯ MARKDOWNV2 ===
 def escape_markdown_v2(text):
-    """Экранирует все спецсимволы для Telegram MarkdownV2"""
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     return re.sub(r'([%s])' % re.escape(escape_chars), r'\\\1', text)
 
-# === ЛОГГИРОВАНИЕ (БЕЗ ЭМОДЗИ, С ПОДДЕРЖКОЙ UTF-8) ===
+# === ЛОГГИРОВАНИЕ ===
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
@@ -31,6 +30,7 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
 active_users = set()
 remind_skipped = {}
+last_deleted = {}  # {user_id: (table, date, meter, deleted_at)}
 
 # === КОНФИГУРАЦИЯ РЕСУРСОВ ===
 RESOURCES = {
@@ -41,6 +41,21 @@ RESOURCES = {
 
 TABLE_TO_DISPLAY = {v["table"]: k for k, v in RESOURCES.items()}
 ALLOWED_TABLES = {v["table"] for v in RESOURCES.values()}
+
+# === СИНОНИМЫ РЕСУРСОВ ===
+RESOURCE_ALIASES = {
+    # Электричество
+    'электричество': 'electricity',
+    'electricity': 'electricity',
+    'электро': 'electricity',
+    'свет': 'electricity',
+    # Вода
+    'вода': 'water',
+    'water': 'water',
+    # Газ
+    'газ': 'gas',
+    'gas': 'gas'
+}
 
 # === РАБОТА С БАЗОЙ ===
 def get_db():
@@ -96,13 +111,12 @@ def _deactivate_user(user_id):
     conn.close()
     logging.info("User %s deactivated.", user_id)
 
-# === ОТПРАВКА СООБЩЕНИЙ (С АВТО-ЭКРАНИРОВАНИЕМ) ===
-def safe_send(user_id, text, parse_mode="MarkdownV2", **kwargs):
-    """Отправляет сообщение с автоматическим экранированием для MarkdownV2"""
+# === ОТПРАВКА СООБЩЕНИЙ С ЭКРАНИРОВАНИЕМ ===
+def safe_send(user_id, text, parse_mode="MarkdownV2", reply_markup=None):
     if parse_mode == "MarkdownV2":
         text = escape_markdown_v2(text)
     try:
-        bot.send_message(user_id, text, parse_mode=parse_mode, **kwargs)
+        bot.send_message(user_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
     except telebot.apihelper.ApiTelegramException as e:
         if e.error_code == 400 and "chat not found" in e.description.lower():
             logging.warning("Chat not found (400) for user %s.", user_id)
@@ -157,6 +171,7 @@ def help_message(message):
         "Команды:\n"
         "• /start — главное меню\n"
         "• /help — эта справка\n"
+        "• /delete — удалить запись\n"
         "• /cancel — отмена и возврат в меню"
     )
     safe_send(message.from_user.id, text, parse_mode="MarkdownV2")
@@ -164,6 +179,141 @@ def help_message(message):
 @bot.message_handler(commands=['cancel'])
 def cancel(message):
     send_menu(message.from_user.id)
+
+# === /delete — УДАЛЕНИЕ ЗАПИСИ С ПОДТВЕРЖДЕНИЕМ ===
+@bot.message_handler(commands=['delete'])
+def delete_entry(message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    parts = text.split(maxsplit=2)
+
+    if len(parts) != 3:
+        help_text = (
+            "❌ Неверный формат команды.\n\n"
+            "Используйте:\n"
+            "`/delete ДД.ММ.ГГГГ ресурс`\n\n"
+            "Пример:\n"
+            "`/delete 25.11.2025 электричество`\n\n"
+            "Доступные ресурсы:\n"
+            "• `электричество` (или `электро`, `свет`)\n"
+            "• `вода`\n"
+            "• `газ`"
+        )
+        safe_send(user_id, help_text, parse_mode="MarkdownV2")
+        return
+
+    _, date_str, resource_input = parts
+    resource_input = resource_input.lower()
+
+    if resource_input not in RESOURCE_ALIASES:
+        safe_send(user_id, "❌ Неизвестный ресурс. Введите `/delete` для подсказки.", parse_mode="MarkdownV2")
+        return
+
+    table = RESOURCE_ALIASES[resource_input]
+    display_name = TABLE_TO_DISPLAY[table]
+
+    try:
+        day, month, year = map(int, date_str.split('.'))
+        if len(str(year)) != 4 or year < 2000 or year > 2100:
+            raise ValueError
+        date_db = f"{year:04d}-{month:02d}-{day:02d}"
+    except ValueError:
+        safe_send(user_id, "❌ Неверный формат даты. Используйте: `ДД.ММ.ГГГГ`", parse_mode="MarkdownV2")
+        return
+
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT meter FROM {table} WHERE date = ?", (date_db,))
+    row = cursor.fetchone()
+
+    if not row:
+        safe_send(user_id, f"❌ Запись за {date_str} в разделе *{display_name}* не найдена.", parse_mode="MarkdownV2")
+        conn.close()
+        return
+
+    meter_value = row[0]
+    conn.close()
+
+    # Сохраняем в контекст для /undo
+    message_to_edit = safe_send(user_id, f"Вы точно хотите удалить запись?\nДата: {date_str}, {display_name}: {int(round(meter_value))}?", parse_mode="MarkdownV2")
+
+    # Инлайн-кнопки подтверждения
+    keyboard = telebot.types.InlineKeyboardMarkup()
+    btn_yes = telebot.types.InlineKeyboardButton("✅ Да", callback_data=f"confirm_delete:{table}:{date_db}:{meter_value}")
+    btn_no = telebot.types.InlineKeyboardButton("❌ Нет", callback_data="cancel_delete")
+    keyboard.add(btn_yes, btn_no)
+    try:
+        bot.edit_message_reply_markup(user_id, message_to_edit.message_id, reply_markup=keyboard)
+    except:
+        pass  # Если не получится — не критично
+
+# === КОЛБЭКИ ДЛЯ УДАЛЕНИЯ ===
+@bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_delete:"))
+def confirm_delete(call):
+    user_id = call.from_user.id
+    try:
+        _, table, date_db, meter_str = call.data.split(":", 3)
+        meter_value = float(meter_str)
+        display_name = TABLE_TO_DISPLAY[table]
+        date_str = datetime.strptime(date_db, "%Y-%m-%d").strftime("%d.%m.%Y")
+
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute(f"DELETE FROM {table} WHERE date = ? AND meter = ?", (date_db, meter_value))
+        if cursor.rowcount > 0:
+            # Сохраняем для /undo
+            last_deleted[user_id] = (table, date_db, meter_value, datetime.now(timezone('Europe/Moscow')))
+            conn.commit()
+            safe_send(user_id, f"✅ Запись удалена:\n*{display_name}*, дата: {date_str}, показания: {int(round(meter_value))}", parse_mode="MarkdownV2")
+        else:
+            safe_send(user_id, "❌ Запись не найдена — возможно, уже удалена.")
+        conn.close()
+        send_menu(user_id)
+    except Exception as e:
+        logging.error("Delete error: %s", e)
+        safe_send(user_id, "❌ Ошибка при удалении.")
+    finally:
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except:
+            pass
+
+@bot.callback_query_handler(func=lambda call: call.data == "cancel_delete")
+def cancel_delete(call):
+    user_id = call.from_user.id
+    bot.edit_message_text("❌ Удаление отменено.", call.message.chat.id, call.message.message_id)
+    send_menu(user_id)
+
+# === /undo — ОТМЕНА УДАЛЕНИЯ ===
+@bot.message_handler(commands=['undo'])
+def undo_delete(message):
+    user_id = message.from_user.id
+    if user_id not in last_deleted:
+        safe_send(user_id, "❌ Нет последней операции удаления для отмены.")
+        return
+
+    table, date_db, meter_value, deleted_at = last_deleted[user_id]
+    now = datetime.now(timezone('Europe/Moscow'))
+    if (now - deleted_at).total_seconds() > 300:  # 5 минут
+        safe_send(user_id, "❌ Отмена невозможна — прошло более 5 минут.")
+        del last_deleted[user_id]
+        return
+
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(f"INSERT INTO {table} (meter, date) VALUES (?, ?)", (meter_value, date_db))
+        conn.commit()
+        display_name = TABLE_TO_DISPLAY[table]
+        date_str = datetime.strptime(date_db, "%Y-%m-%d").strftime("%d.%m.%Y")
+        safe_send(user_id, f"✅ Восстановлено:\n*{display_name}*, дата: {date_str}, показания: {int(round(meter_value))}", parse_mode="MarkdownV2")
+        del last_deleted[user_id]
+    except Exception as e:
+        safe_send(user_id, "❌ Не удалось восстановить: ошибка базы данных.")
+        logging.error("Undo error: %s", e)
+    finally:
+        conn.close()
+    send_menu(user_id)
 
 # === ПРОВЕРКА: ВВЕДЕНЫ ЛИ ЗА МЕСЯЦ ===
 def has_user_entered_current_month_data():
@@ -204,7 +354,6 @@ def save_meter_reading(message, table):
     conn = get_db()
     cursor = conn.cursor()
 
-    # Проверка: уже вводили сегодня?
     cursor.execute(f"SELECT 1 FROM {table} WHERE date = date('now') LIMIT 1")
     if cursor.fetchone():
         safe_send(user_id, "⚠️ Показания на сегодня уже внесены!")
@@ -212,11 +361,9 @@ def save_meter_reading(message, table):
         send_menu(user_id)
         return
 
-    # Получаем последнее значение
     cursor.execute(f"SELECT meter FROM {table} ORDER BY date DESC LIMIT 1")
     row = cursor.fetchone()
 
-    # Проверка: не уменьшаются ли показания
     if row:
         prev_value = float(row[0])
         if meter_value < prev_value:
@@ -236,12 +383,10 @@ def save_meter_reading(message, table):
             bot.register_next_step_handler(message, lambda msg: save_meter_reading(msg, table))
             return
 
-    # Сохраняем
     cursor.execute(f'INSERT INTO {table} (meter, date) VALUES (?, date("now"))', (meter_value,))
     conn.commit()
     conn.close()
 
-    # Ответ пользователю
     display_name = TABLE_TO_DISPLAY[table]
     unit = RESOURCES[display_name]["unit"]
     rounded_value = int(round(meter_value))
@@ -309,6 +454,29 @@ def monthly_stats(message):
     conn.close()
     send_menu(user_id)
 
+# === ЭХО-ОБРАБОТЧИК ===
+@bot.message_handler(func=lambda message: True)
+def echo_handler(message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    known_inputs = {
+        "⚡ Электричество",
+        "💧 Вода",
+        "🔥 Газ",
+        "📆 Статистика"
+    }
+    commands = {'/start', '/help', '/cancel', '/delete', '/undo'}
+
+    if text in known_inputs or text in commands:
+        return
+
+    response = (
+        f"Вы написали: *{escape_markdown_v2(text)}*\n\n"
+        f"Пожалуйста, выберите действие через меню ⬇️"
+    )
+    safe_send(user_id, response, parse_mode="MarkdownV2")
+    send_menu(user_id)
+
 # === НАПОМИНАНИЯ ===
 scheduler = BackgroundScheduler(timezone=timezone('Europe/Moscow'))
 scheduler.start()
@@ -366,39 +534,6 @@ def remind_done(call):
     cursor.execute("UPDATE users SET remind_skipped = 1 WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
-
-# === ЭХО-ОБРАБОТЧИК: НЕИЗВЕСТНЫЕ СООБЩЕНИЯ ===
-@bot.message_handler(func=lambda message: True)
-def echo_handler(message):
-    user_id = message.from_user.id
-
-    # Проверим: не ожидает ли бот ввод показаний?
-    # Если ожидает — не вмешиваемся (обработает save_meter_reading)
-    # Здесь мы просто пропускаем, если бот уже в режиме ввода
-    # (реализация отслеживания состояний — в будущем можно улучшить через FSM)
-    
-    # Пока просто исключим команды и пункты меню
-    text = message.text.strip()
-    known_inputs = {
-        "⚡ Электричество",
-        "💧 Вода",
-        "🔥 Газ",
-        "📆 Статистика"
-    }
-    commands = {'/start', '/help', '/cancel'}
-
-    if text in known_inputs or text in commands:
-        return  # Уже обработано другими хэндлерами
-
-    # Экранируем текст для MarkdownV2
-    user_text = message.text
-    response = (
-        f"Вы написали: *{escape_markdown_v2(user_text)}*\n\n"
-        f"Пожалуйста, выберите действие через меню ⬇️"
-    )
-    safe_send(user_id, response, parse_mode="MarkdownV2")
-    send_menu(user_id)
-
 
 # === ЗАПУСК ===
 if __name__ == '__main__':
