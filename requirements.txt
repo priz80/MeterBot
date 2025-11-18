@@ -1,0 +1,4 @@
+pytelegrambotapi
+apscheduler
+python-dotenv
+pytz
