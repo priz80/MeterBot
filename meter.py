@@ -8,6 +8,16 @@ import time
 import logging
 import re
 
+from dotenv import load_dotenv
+import os
+
+load_dotenv()  # Загружает .env
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не найден в .env файле!")
+
+
 # === ФУНКЦИЯ ЭКРАНИРОВАНИЯ ДЛЯ MARKDOWNV2 ===
 def escape_markdown_v2(text):
     escape_chars = r'_*[]()~`>#+-=|{}.!'
@@ -24,7 +34,6 @@ logging.basicConfig(
 )
 
 # === НАСТРОЙКИ ===
-BOT_TOKEN = 'xxx'  # ← Замените на свой
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
